@@ -1,0 +1,1823 @@
+#include "HelloWorldScene.h"
+#include "PauseScene.hpp"
+
+#define VISIBLE_SIZE Director::getInstance()->getVisibleSize()
+
+USING_NS_CC;
+
+using namespace cocostudio::timeline;
+
+const float MOVETIME=0.3f;
+const string FILENAME="GameData.txt";
+#define HIGHSCORE "high_score";
+
+Scene* GameScene::createScene()
+{
+    auto scene = Scene::create();
+    auto layer = GameScene::create();
+    scene->addChild(layer);
+    return scene;
+}
+
+bool GameScene::init()
+{
+    if ( !Layer::init() )
+    {
+        return false;
+    }
+    
+    //检查是否有存档，如果有提示加载
+    if(TDInvFileUtils::isGameSaveExist(FILENAME))
+    {
+        auto layer=LayerColor::create(Color4B(100,100,100,100));
+        this->addChild(layer);
+        m_status=STATUS::PAUSE;
+        
+        auto btn_yes=ui::Button::create("59.png");
+        btn_yes->setPosition(Vec2(VISIBLE_SIZE/2) + Vec2(-100,0));
+        layer->addChild(btn_yes);
+        
+        btn_yes->addClickEventListener([=](Ref *){
+            layer->removeFromParent();
+            this->readGame();
+            m_status=STATUS::NORMAL;
+        });
+        
+        auto btn_no=ui::Button::create("59.png");
+        btn_no->setPosition(Vec2(VISIBLE_SIZE/2) + Vec2(100,0));
+        layer->addChild(btn_no);
+        
+        btn_no->addClickEventListener([=](Ref *){
+            layer->removeFromParent();
+            this->initMatrix();
+            m_status=STATUS::NORMAL;
+        });
+    }
+    else
+    {
+        //循环保证开局时至少有5对可消除的麻将牌
+        do
+        {
+            for(int i=0;i<MATRIX_WIDTH;i++)
+            {
+                for(int j=0;j<MATRIX_HEIGHT;j++)
+                {
+                    if(m_matrix[i][j])
+                    {
+                        m_matrix[i][j]->removeFromParent();
+                        m_matrix[i][j]=nullptr;
+                    }
+                }
+            }
+            
+            initMatrix();
+        }while(!this->isFivePair());
+     }
+    
+    //读取最高分纪录
+    auto temp=TDInvFileUtils::getHighFile(SCOREFILE);
+    this->m_score=temp.score;
+
+    this->start_pos=Vec2(VISIBLE_SIZE.width/2 + (0 - (MATRIX_WIDTH-1)/2) * MATRIX_SIZZE_X ,VISIBLE_SIZE.height/2 +(0 - MATRIX_HEIGHT/2) * MATRIX_SIZZE_Y + MATRIX_SIZZE_Y/2)+Vec2(-MATRIX_SIZZE_X/2,-MATRIX_SIZZE_Y/2);
+
+    initUI();
+    scheduleUpdate();
+   
+
+    //初始化movestep数据，保证移动时能正常移动
+    movestep.selectGrid=nullptr;
+    movestep.dr=Direction::NONE;
+    movestep.girdNum=0;
+    movestep.steps=0;
+    
+    auto listener=EventListenerTouchOneByOne::create();
+    
+    listener->onTouchBegan=[=](Touch* touch,Event*event){
+        if(this->m_status==STATUS::PALYANI || this->m_status==STATUS::PAUSE)
+            return false;
+        
+        auto touchPos=touch->getLocation();
+        
+        if(this->m_selected)
+        {
+            //移动完麻将牌等待选择的情况
+            if(this->m_status==STATUS::WATIFORCLICK)
+            {
+                auto another=clicked(touchPos);
+                if(another && this->checkRemoveAble(m_selected, another))
+                {
+                    //开始准备纪录操作
+                    mahjong mj_main;
+                    mj_main.value=m_selected->getValue();
+                    mj_main.x_pos=m_selected->getX();
+                    mj_main.y_pos=m_selected->getY();
+                    mj_main.old_pos=m_selected->getOldPos();
+                    
+                    mahjong mj_sub;
+                    mj_sub.value=another->getValue();
+                    mj_sub.x_pos=another->getX();
+                    mj_sub.y_pos=another->getY();
+                    mj_sub.old_pos=another->getOldPos();
+                    
+                    Direction dr=movestep.dr;
+                    auto dis_x=static_cast<int>(fabs(m_selected->getOldPos().x-m_selected->getX()));
+                    auto dis_y=static_cast<int>(fabs(m_selected->getOldPos().y-m_selected->getY()));
+                    
+                    int steps=dis_x>dis_y?dis_x:dis_y;
+                    
+                    int num=movestep.girdNum;
+
+                    MoveCount temp;
+                    temp.mj_main=mj_main;
+                    temp.mj_sub=mj_sub;
+                    temp.dr=static_cast<int>(dr);
+                    temp.steps=steps;
+                    temp.num=num;
+                    
+                    this->controlCount.push_back(temp);
+                    //end
+                    movestep.dr=Direction::NONE;
+                    
+                    //成功清除，指针置空、添加分数、保存游戏进度
+                    m_matrix[another->getX()][another->getY()]=nullptr;
+                    m_matrix[m_selected->getX()][m_selected->getY()]=nullptr;
+                    
+                    another->removeFromParent();
+                    m_selected->removeFromParent();
+                    
+                    m_selected=nullptr;
+                    
+                    m_score_now+=SCORE;
+                    this->SaveGame();
+                }
+                else
+                {
+                    for(int i=0;i<MATRIX_WIDTH;i++)
+                    {
+                        for(int j=0;j<MATRIX_HEIGHT;j++)
+                        {
+                            if(m_matrix[i][j] && m_matrix[i][j]->getUnity())
+                            {
+                                m_matrix[i][j]->setUnity(false);
+                            }
+                        }
+                    }
+                    
+                    //消除无效，取消移动，指针置空
+                    this->moveCance();
+                    
+                    m_selected->notSelect();
+                    m_selected=nullptr;
+                }
+                
+                this->m_status=STATUS::NORMAL;
+                return false;
+                
+            }
+            
+            //已选中一个的情况
+            auto another=clicked(touchPos);
+            if(another && this->checkRemoveAble(m_selected, another))
+            {
+                //成功消除
+                mahjong mj_main;
+                mj_main.value=m_selected->getValue();
+                mj_main.x_pos=m_selected->getX();
+                mj_main.y_pos=m_selected->getY();
+                mj_main.old_pos=m_selected->getOldPos();
+                
+                mahjong mj_sub;
+                mj_sub.value=another->getValue();
+                mj_sub.x_pos=another->getX();
+                mj_sub.y_pos=another->getY();
+                mj_sub.old_pos=another->getOldPos();
+                
+                Direction dr=Direction::NONE;
+                int num=0;
+                int steps=0;
+                
+                MoveCount temp;
+                temp.mj_main=mj_main;
+                temp.mj_sub=mj_sub;
+                temp.dr=static_cast<int>(dr);
+                temp.steps=steps;
+                temp.num=num;
+                
+                controlCount.push_back(temp);
+                
+                m_matrix[another->getX()][another->getY()]=nullptr;
+                m_matrix[m_selected->getX()][m_selected->getY()]=nullptr;
+                
+                another->removeFromParent();
+                m_selected->removeFromParent();
+                
+                m_selected=nullptr;
+                
+                m_score_now+=SCORE;
+                this->SaveGame();
+            }
+            else
+            {
+                this->m_selected->notSelect();
+                this->m_selected=nullptr;
+                return false;
+            }
+        }
+        else if(this->m_status==STATUS::NORMAL)
+        {
+            //尚未选择的情况
+            if(this->m_selected)
+            {
+                this->m_selected->notSelect();
+                this->m_selected=nullptr;
+            }
+            
+            auto one=clicked(touchPos);
+            if(one)
+            {
+                this->m_isGameStart=true;
+                
+                this->m_selected=one;
+                this->m_selected->select();
+                
+                return true;
+            }
+        }
+        
+        return false;
+    };
+    
+    listener->onTouchMoved=[=](Touch *touch,Event *event){
+        if(this->m_status==STATUS::PALYANI)
+            return;
+        auto touchPos=touch->getLocation();
+        auto vec=this->convertPosToMatrix(touchPos);
+        auto oldPos=Vec2(m_selected->getX(),m_selected->getY());
+        vec-=oldPos;
+        
+        //已移动的状态下如果碰到不能移动的麻将牌则停止
+        if (movestep.dr!=Direction::NONE && movestep.girdNum!=0)
+        {
+            auto x=movestep.selectGrid->getX();
+            auto y=movestep.selectGrid->getY();
+            
+            switch (movestep.dr)
+            {
+                case Direction::UP:
+                {
+                    if(y+movestep.girdNum>=MATRIX_HEIGHT)
+                        return;
+                    auto temp=m_matrix[x][y+movestep.girdNum];
+                    if(temp)
+                        return;
+                }
+                    break;
+                case Direction::DOWN:
+                {
+                    if(y-movestep.girdNum<0)
+                        return;
+                    auto temp=m_matrix[x][y-movestep.girdNum];
+                    if(temp)
+                        return;
+                }
+                    break;
+                case Direction::LEFT:
+                {
+                    if(x-movestep.girdNum<0)
+                        return;
+                    auto temp=m_matrix[x-movestep.girdNum][y];
+                    if(temp)
+                        return;
+                }
+                    break;
+                case Direction::RIGHT:
+                {
+                    if(x+movestep.girdNum>=MATRIX_WIDTH)
+                        return;
+                    auto temp=m_matrix[x+movestep.girdNum][y];
+                    if(temp)
+                        return;
+                }
+                default:
+                    break;
+            }
+        }
+        
+        
+        //同一列移动的情况
+        if(fabs(vec.y)<fabs(vec.x) &&vec.y==0)
+        {
+            if(vec.x>0)
+            {
+                //right
+                if(!(movestep.dr==Direction::RIGHT || movestep.dr==Direction::NONE))
+                    return;
+              
+                if(this->checkMoveAble(m_selected, Direction::RIGHT))
+                {
+                    movestep.selectGrid=m_selected;
+                    movestep.girdNum=0;
+                    movestep.dr=Direction::RIGHT;
+                    bool flag=false;
+                    
+                    for(int i=m_selected->getX();i<MATRIX_WIDTH;i++)
+                    {
+                        if(m_matrix[i][m_selected->getY()])
+                        {
+                            if(flag)
+                            {
+                                break;
+                            }
+                            movestep.girdNum++;
+                            m_matrix[i][m_selected->getY()]->setUnity(true);
+                        }
+                        else
+                        {
+                            flag=true;
+                        }
+                    }
+                    if(flag)
+                        this->matrixMove(true);
+                    return;        
+                }
+            }
+            else if(vec.x<0)
+            {
+                //left
+                if(!(movestep.dr==Direction::LEFT || movestep.dr==Direction::NONE))
+                    return;
+                
+                if(this->checkMoveAble(m_selected, Direction::LEFT))
+                {
+                    movestep.selectGrid=m_selected;
+                    movestep.girdNum=0;
+                    movestep.dr=Direction::LEFT;
+                    bool flag=false;
+                    
+                    for(int i=m_selected->getX();i>=0;i--)
+                    {
+                        if(m_matrix[i][m_selected->getY()])
+                        {
+                            if(flag)
+                            {
+                                break;
+                            }
+                            movestep.girdNum++;
+                        }
+                        else
+                        {
+                            flag=true;
+                        }
+                    }
+                    if(flag)
+                        this->matrixMove(true);
+                    return;
+                }
+            }
+        }
+        else if(fabs(vec.x)<fabs(vec.y) && vec.x==0)
+        {
+            if(vec.y>0 && fabs(vec.x)<MATRIX_SIZZE_X/2)
+            {
+                //up
+                if(!(movestep.dr==Direction::UP || movestep.dr==Direction::NONE))
+                    return;
+                
+                if(this->checkMoveAble(m_selected, Direction::UP))
+                {
+                    movestep.selectGrid=m_selected;
+                    movestep.girdNum=0;
+                    movestep.dr=Direction::UP;
+                    
+                    bool flag=false;
+                    for(int i=m_selected->getY();i<MATRIX_HEIGHT;i++)
+                    {
+                        if(m_matrix[m_selected->getX()][i])
+                        {
+                            if(flag)
+                            {
+                                break;
+                            }
+                            movestep.girdNum++;
+                        }
+                        else
+                        {
+                            flag=true;
+                        }
+                    }
+                    if(flag)
+                        this->matrixMove(true);
+                    return;
+                }
+            }
+            else if(vec.y<0 && fabs(vec.x)<MATRIX_SIZZE_Y/2)
+            {
+                //down
+                if(!(movestep.dr==Direction::DOWN || movestep.dr==Direction::NONE))
+                    return;
+                
+                if(this->checkMoveAble(m_selected, Direction::DOWN))
+                {
+                    movestep.selectGrid=m_selected;
+                    movestep.girdNum=0;
+                    movestep.dr=Direction::DOWN;
+                    
+                    bool flag=false;
+                    for(int i=m_selected->getY();i>=0;i--)
+                    {
+                        if(m_matrix[m_selected->getX()][i])
+                        {
+                            if(flag)
+                            {
+                                break;
+                            }
+                            movestep.girdNum++;
+                        }
+                        else
+                        {
+                            flag=true;
+                        }
+                    }
+                    if(flag)
+                        this->matrixMove(true);
+                    return;
+                }
+
+            }
+        }
+    };
+    
+    listener->onTouchEnded=[=](Touch *touch,Event *event)
+    {
+        if(movestep.selectGrid==nullptr || movestep.dr==Direction::NONE || movestep.steps==0)
+        {
+            return;
+        }
+        //判断停下来的地方有没有能消除的麻将牌，如果有则停下来等，没有则返回
+        if(this->checkRemoveAble(m_selected,Direction::UP) || this->checkMoveAble(m_selected, Direction::DOWN) || this->checkMoveAble(m_selected, Direction::LEFT) || this->checkMoveAble(m_selected, Direction::RIGHT))
+        {
+            this->m_status=STATUS::WATIFORCLICK;
+            return;
+        }
+    };
+    
+    _eventDispatcher->addEventListenerWithSceneGraphPriority(listener, this);
+    
+    return true;
+}
+
+void GameScene::initMatrix()
+{
+    mahjongCount.clear();
+    //记录每块麻将牌对应的个数，保证每个麻将牌都有4块
+    for(int i=1;i<=29;i++)
+    {
+        if(i==10||i==20)
+            continue;
+        else
+        {
+            mahjongCount.insert(std::pair<int,int>(i,0));
+        }
+    }
+    
+    //从左到右，从下到上的加载矩阵
+    for(int i=0;i<MATRIX_WIDTH;i++)
+    {
+        for(int j=0;j<MATRIX_HEIGHT;j++)
+        {
+            auto dis=MATRIX_SIZZE_Y * (i + j*2);
+            float time=dis/MATRIX_SIZZE_Y /8;
+            
+            int value;
+            while (true)
+            {
+                value=random(1, 29);
+                if(value==10||value==20)
+                    continue;
+                else
+                {
+                    auto temp=mahjongCount.find(value);
+                    if(temp!=mahjongCount.end())
+                    {
+                        if(temp->second<4)
+                        {
+                            temp->second++;
+                            break;
+                        }
+                    }
+                }
+            }
+            
+            auto grid=Grid::create(value);
+            grid->setPosition(Vec2(VISIBLE_SIZE.width/2 + (i - (MATRIX_WIDTH-1)/2) * MATRIX_SIZZE_X ,VISIBLE_SIZE.height/2 +(j - MATRIX_HEIGHT/2) * MATRIX_SIZZE_Y + MATRIX_SIZZE_Y/2 + dis));
+            grid->setXY(i, j);
+            this->m_matrix[i][j]=grid;
+            this->addChild(grid);
+            
+            grid->runAction(Sequence::create(CallFuncN::create([=](Ref *){
+                this->m_status=STATUS::PALYANI;
+            }),MoveBy::create(time, Vec2(0,-dis)),CallFuncN::create([=](Ref *){
+                this->m_status=STATUS::NORMAL;
+            }), NULL));
+        }
+    }
+}
+
+//通过触摸点坐标获取点击到的麻将牌坐标
+Grid* GameScene::clicked(Vec2 pos)
+{
+    for(int i=0;i<MATRIX_WIDTH;i++)
+    {
+        for(int j=0;j<MATRIX_HEIGHT;j++)
+        {
+            if(!m_matrix[i][j])
+            {
+                continue;
+            }
+            
+            if(m_matrix[i][j]->getBoundingBox().containsPoint(pos))
+            {
+                return m_matrix[i][j];
+            }
+        }
+    }
+    return nullptr;
+}
+
+//检查在某个方向上该麻将牌能否移动
+bool GameScene::checkMoveAble(Grid * gr,Direction dr)
+{
+    switch (dr) {
+        case Direction::UP:
+        {
+            auto y=gr->getY();
+            if(y==MATRIX_HEIGHT)
+                return false;
+            else
+            {
+                for(int i=y+1;i<MATRIX_HEIGHT;i++)
+                {
+                    if(m_matrix[gr->getX()][i]==nullptr)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+            break;
+        case Direction::DOWN:
+        {
+            auto y=gr->getY();
+            if(y==0)
+                return false;
+            else
+            {
+                for(int i=y-1;i>=0;i--)
+                {
+                    if(m_matrix[gr->getX()][i]==nullptr)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+            break;
+        case Direction::RIGHT:
+        {
+            auto x=gr->getX();
+            if(x==MATRIX_WIDTH)
+                return false;
+            else
+            {
+                for(int i=x+1;i<MATRIX_WIDTH;i++)
+                {
+                    if(m_matrix[i][gr->getY()]==nullptr)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+            break;
+        case Direction::LEFT:
+        {
+            auto x=gr->getX();
+            if(x==0)
+                return false;
+            else
+            {
+                for(int i=x-1;i>=0;i--)
+                {
+                    if(m_matrix[i][gr->getY()]==nullptr)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+            break;
+        default:break;
+    }
+    
+    return false;
+}
+
+//将位置的坐标转换为麻将矩阵中的坐标
+Vec2 GameScene::convertPosToMatrix(Vec2 pos)
+{
+    pos-=this->start_pos;
+    int x=pos.x/MATRIX_SIZZE_X;
+    int y=pos.y/MATRIX_SIZZE_Y;
+    
+    Vec2 vec=Vec2(x,y);
+    
+    return vec;
+}
+
+//麻将矩阵的移动
+void GameScene::matrixMove(bool b)
+{
+    auto x=movestep.selectGrid->getX();
+    auto y=movestep.selectGrid->getY();
+    
+    int step;
+    if(b)
+    {
+        //如果是触摸屏幕移动则固定移动一格
+        step=1;
+    }
+    else
+    {
+        //如果是消除无效后的返回则移动固定的格数
+        step=movestep.steps;
+    }
+    switch (movestep.dr) {
+        case Direction::UP:
+        {
+            for(int i=y+movestep.girdNum -1;i>=y;i--)
+            {
+                m_matrix[x][i]->setXY(x, i + 1 *step);
+                m_matrix[x][i+1*step]=m_matrix[x][i];
+                m_matrix[x][i]=nullptr;
+                
+                m_matrix[x][i+1*step]->runAction(Sequence::create(CallFuncN::create([=](Ref *){
+                    this->m_status=STATUS::PALYANI;
+                }), MoveBy::create(MOVETIME *step , Vec2(0,MATRIX_SIZZE_Y *step )),CallFuncN::create([=](Ref *){
+                    if(b)
+                    {
+                        //如果是由屏幕移动调用的，则切换到等待状态，等待选取可消除的麻将牌
+                        this->m_status=STATUS::WATIFORCLICK;
+                    }
+                    else
+                    {
+                        //如果是由消除无效后返回调用的，则切换的正常状态，等待下一次操作
+                        this->m_status=STATUS::NORMAL;
+                    }
+                }),NULL));
+            }
+        }
+            break;
+        case Direction::DOWN:
+        {
+            for(int i=y-movestep.girdNum +1;i<=y;i++)
+            {
+                m_matrix[x][i]->setXY(x, i - 1*step);
+                m_matrix[x][i-1*step]=m_matrix[x][i];
+                m_matrix[x][i]=nullptr;
+                
+                m_matrix[x][i-1*step]->runAction(Sequence::create(CallFuncN::create([=](Ref *){
+                    this->m_status=STATUS::PALYANI;
+                }), MoveBy::create(MOVETIME *step , Vec2(0,-MATRIX_SIZZE_Y *step)),CallFuncN::create([=](Ref *){
+                    if(b)
+                    {
+                        this->m_status=STATUS::WATIFORCLICK;
+                    }
+                    else
+                    {
+                        this->m_status=STATUS::NORMAL;
+                    }
+                }),NULL));
+
+            }
+        }
+            break;
+        case Direction::LEFT:
+        {
+            for(int i=x- movestep.girdNum +1;i<=x;i++)
+            {
+                m_matrix[i][y]->setXY(i - 1*step, y);
+                m_matrix[i-1*step][y]=m_matrix[i][y];
+                m_matrix[i][y]=nullptr;
+                
+                m_matrix[i-1*step][y]->runAction(Sequence::create(CallFuncN::create([=](Ref *){
+                    this->m_status=STATUS::PALYANI;
+                }), MoveBy::create(MOVETIME *step,Vec2(-MATRIX_SIZZE_X  *step,0)),CallFuncN::create([=](Ref *){
+                    if(b)
+                    {
+                        this->m_status=STATUS::WATIFORCLICK;
+                    }
+                    else
+                    {
+                        this->m_status=STATUS::NORMAL;
+                    }
+                }),NULL));
+
+            }
+        }
+            break;
+        case Direction::RIGHT:
+        {
+            for(int i=x + movestep.girdNum -1;i>=x;i--)
+            {
+                m_matrix[i][y]->setXY(i + 1*step, y);
+                m_matrix[i+1*step][y]=m_matrix[i][y];
+                m_matrix[i][y]=nullptr;
+                
+                m_matrix[i+1*step][y]->runAction(Sequence::create(CallFuncN::create([=](Ref *){
+                    this->m_status=STATUS::PALYANI;
+                }), MoveBy::create(MOVETIME *step,Vec2(MATRIX_SIZZE_X *step ,0)),CallFuncN::create([=](Ref *){
+                    if(b)
+                    {
+                        this->m_status=STATUS::WATIFORCLICK;
+                    }
+                    else
+                    {
+                        this->m_status=STATUS::NORMAL;
+                    }
+                }),NULL));
+            }
+        }
+            break;
+        default:break;
+    }
+}
+
+//当移动失效后返回原位，通过修改movestep的数据并调用matrixMove函数实现
+void GameScene::moveCance()
+{
+    auto x=m_selected->getX();
+    auto y=m_selected->getY();
+    
+    //oldPos是麻将牌被选中时初始化的一个参数，记录当时麻将牌的位置，在这里可以通过oldPos知道要返回到那里
+    auto oldPos=m_selected->getOldPos();
+    
+    Grid* m_temp=nullptr;
+    switch (movestep.dr) {
+        case Direction::UP:
+        {
+            m_temp=m_matrix[x][y+movestep.girdNum-1];
+            movestep.dr=Direction::DOWN;
+            
+            movestep.steps=y-oldPos.y;
+        }
+            break;
+        case Direction::DOWN:
+        {
+            m_temp=m_matrix[x][y-movestep.girdNum+1];
+            movestep.dr=Direction::UP;
+            
+            movestep.steps=oldPos.y-y;
+        }
+            break;
+        case Direction::LEFT:
+        {
+            m_temp=m_matrix[x-movestep.girdNum +1][y];
+            movestep.dr=Direction::RIGHT;
+            
+            movestep.steps=oldPos.x-x;
+        }
+            break;
+        case Direction::RIGHT:
+        {
+            m_temp=m_matrix[x+movestep.girdNum -1][y];
+            movestep.dr=Direction::LEFT;
+            
+            movestep.steps=x-oldPos.x;
+        }
+            break;
+        default:break;
+    }
+    if(movestep.steps==0)
+        return;
+    movestep.selectGrid=m_temp;
+    this->matrixMove(false);
+    
+    //返回后将movestep数据置空
+    movestep.selectGrid=nullptr;
+    movestep.dr=Direction::NONE;
+    movestep.girdNum=0;
+    movestep.steps=0;
+}
+
+void GameScene::initUI()
+{
+    auto lab_score=Label::createWithSystemFont("0000", "", 40);
+    this->addChild(lab_score,1,2);
+    lab_score->setPosition(Vec2(MATRIX_SIZZE_X * 2,MATRIX_SIZZE_Y));
+    
+    lab_score->setString(StringUtils::format("最高得分%d",m_score));
+    
+    auto button_help=ui::Button::create("59.png");
+    button_help->setPosition(Vec2(VISIBLE_SIZE.width-MATRIX_SIZZE_X * 4,MATRIX_SIZZE_Y/2));
+    this->addChild(button_help);
+    
+    button_help->addClickEventListener([=](Ref *){
+        //temp
+        
+    });
+    
+    auto button_tips=ui::Button::create("59.png");
+    button_tips->setPosition(Vec2(VISIBLE_SIZE.width-MATRIX_SIZZE_X * 3,MATRIX_SIZZE_Y/2));
+    this->addChild(button_tips);
+    
+    button_tips->addClickEventListener([=](Ref *){
+        //游戏提示
+        if(this->m_status!=STATUS::NORMAL)
+            return;
+        if(this->m_tipsTime<=0)
+            return;
+        else
+            this->m_tipsTime++;
+        
+        for(int i=0;i<MATRIX_WIDTH;i++)
+        {
+            for(int j=0;j<MATRIX_HEIGHT;j++)
+            {
+                if(m_matrix[i][j] && this->checkRemoveAble(m_matrix[i][j],true))
+                {
+                    return;
+                }
+            }
+        }
+        
+        auto lab_temp=Label::createWithSystemFont("Can not Move", "", 40);
+        lab_temp->setPosition(VISIBLE_SIZE/2);
+        this->addChild(lab_temp);
+        
+        lab_temp->runAction(Sequence::create(DelayTime::create(0.5f),CallFuncN::create([=](Ref *){
+            lab_temp->removeFromParent();
+        }), NULL));
+    });
+    
+    auto button_ctrlz=ui::Button::create("59.png");
+    button_ctrlz->setPosition(Vec2(VISIBLE_SIZE.width-MATRIX_SIZZE_X * 2,MATRIX_SIZZE_Y/2));
+    this->addChild(button_ctrlz);
+    
+    button_ctrlz->addClickEventListener([=](Ref *){
+        //撤销操作
+        if(controlCount.empty())
+            return;
+        
+        if(this->m_status!=STATUS::NORMAL)
+            return;
+        
+        auto temp=controlCount.back();
+        controlCount.pop_back();
+        //恢复消除的麻将牌
+        auto mj_main=Grid::create(temp.mj_main.value);
+        mj_main->setXY(temp.mj_main.x_pos, temp.mj_main.y_pos);
+        mj_main->setOldPos(temp.mj_main.old_pos);
+        mj_main->setPosition(Vec2(VISIBLE_SIZE.width/2 + (temp.mj_main.x_pos - (MATRIX_WIDTH-1)/2) * MATRIX_SIZZE_X ,VISIBLE_SIZE.height/2 +(temp.mj_main.y_pos - MATRIX_HEIGHT/2) * MATRIX_SIZZE_Y + MATRIX_SIZZE_Y/2 ));
+        m_matrix[temp.mj_main.x_pos][temp.mj_main.y_pos]=mj_main;
+        this->addChild(mj_main);
+        
+        auto mj_sub=Grid::create(temp.mj_sub.value);
+        mj_sub->setXY(temp.mj_sub.x_pos, temp.mj_sub.y_pos);
+        mj_sub->setPosition(Vec2(VISIBLE_SIZE.width/2 + (temp.mj_sub.x_pos - (MATRIX_WIDTH-1)/2) * MATRIX_SIZZE_X ,VISIBLE_SIZE.height/2 +(temp.mj_sub.y_pos - MATRIX_HEIGHT/2) * MATRIX_SIZZE_Y + MATRIX_SIZZE_Y/2 ));
+        m_matrix[temp.mj_sub.x_pos][temp.mj_sub.y_pos]=mj_sub;
+        this->addChild(mj_sub);
+        //拿走获得的分数
+        this->m_score_now-=SCORE;
+        //操作步骤减1 to do
+        //移动过的麻将牌回到原位
+        m_selected=mj_main;
+        movestep.dr=static_cast<Direction>(temp.dr);
+        movestep.girdNum=temp.num;
+        movestep.steps=temp.steps;
+        
+        this->moveCance();
+        //保存游戏
+        this->SaveGame();
+    });
+    
+    auto button_pause=ui::Button::create("59.png");
+    button_pause->setPosition(Vec2(VISIBLE_SIZE.width-MATRIX_SIZZE_X,MATRIX_SIZZE_Y/2));
+    this->addChild(button_pause);
+    
+    button_pause->addClickEventListener([=](Ref *){
+        if(this->m_status==STATUS::PAUSE)
+            return;
+        this->setPauseScene();
+    });
+}
+
+//检查某一个指定的麻将牌能否被消除，第二个参数表面需不需要直接提示
+bool GameScene::checkRemoveAble(Grid * gr,bool b)
+{
+    auto x=gr->getX();
+    auto y=gr->getY();
+    
+    //up
+    for(int i=y+1;i<MATRIX_HEIGHT;i++)
+    {
+        if(m_matrix[x][i]!=nullptr)
+        {
+            if (m_matrix[x][i]->getValue()==gr->getValue())
+            {
+                if(b)
+                {
+                    m_matrix[x][i]->setTips();
+                    gr->setTips();
+                }
+                
+                return true;
+            }
+            else
+            {
+                break;
+            }
+        }
+        else
+            continue;
+    }
+
+    //down
+    for(int i=y-1;i>=0;i--)
+    {
+        if(m_matrix[x][i]!=nullptr)
+        {
+            if(m_matrix[x][i]->getValue()==gr->getValue())
+            {
+                if(b)
+                {
+                    m_matrix[x][i]->setTips();
+                    gr->setTips();
+                }
+                return true;
+            }
+            else
+                break;
+        }
+        else
+            continue;
+    }
+    
+    //right
+    for(int j=x+1;j<MATRIX_WIDTH;j++)
+    {
+        if(m_matrix[j][y])
+        {
+            if (m_matrix[j][y]->getValue()==gr->getValue())
+            {
+                if(b)
+                {
+                    m_matrix[j][y]->setTips();
+                    gr->setTips();
+                }
+                return true;
+            }
+            else
+            {
+                break;
+            }
+        }
+        else
+            continue;
+    }
+    
+    //left
+    for(int j=x-1;j>=0;j--)
+    {
+        if(m_matrix[j][y])
+        {
+            if (m_matrix[j][y]->getValue()==gr->getValue())
+            {
+                if(b)
+                {
+                    m_matrix[j][y]->setTips();
+                    gr->setTips();
+                }
+                return true;
+            }
+            else
+            {
+                break;
+            }
+        }
+        else
+            continue;
+
+    }
+    
+    //检查能否在移动后被消除
+    int left=0,right=0;
+    bool flag=false;
+    for(int i=x;i>=0;i--)
+    {
+        if(m_matrix[i][y]==nullptr)
+        {
+            left++;
+            flag=true;
+        }
+        else
+        {
+            if(flag)
+                break;
+        }
+    }
+    
+    if(flag)//可以向左移动left格
+    {
+        for(int i=x-1;left>0;i--,left--)
+        {
+            //对上面一行的判断
+            if(y<MATRIX_HEIGHT-1)
+            {
+                for(int j=y+1;j<MATRIX_HEIGHT;j++)
+                {
+                    if(m_matrix[i][j])
+                    {
+                        if(m_matrix[i][j]->getValue() == gr->getValue())
+                        {
+                            if(b)
+                            {
+                                m_matrix[i][j]->setTips();
+                                gr->setTips();
+                            }
+                            return true;
+                        }
+                        else
+                        {
+                            break;
+                        }
+                        
+                    }
+                    else
+                        continue;
+                }
+            }
+            //对下面一行的判断
+            if(y>0)
+            {
+                for(int j=y-1;j>=0;j--)
+                {
+                    if(m_matrix[i][j])
+                    {
+                        if(m_matrix[i][j]->getValue() == gr->getValue())
+                        {
+                            if(b)
+                            {
+                                m_matrix[i][j]->setTips();
+                                gr->setTips();
+                            }
+                            return true;
+                        }
+                        else
+                        {
+                            break;
+                        }
+                        
+                    }
+                    else
+                        continue;
+                }
+
+            }
+        }
+    }
+    
+    flag=false;
+    for(int i=x;i<MATRIX_WIDTH;i++)
+    {
+        if(m_matrix[i][y]==nullptr)
+        {
+            right++;
+            flag=true;
+        }
+        else
+        {
+            if(flag)
+                break;
+        }
+    }
+    
+    if(flag)//可以向右移动right格
+    {
+        for(int i=x+1;right>0;i++,right--)
+        {
+            //对上面一行的判断
+            if(y<MATRIX_HEIGHT-1)
+            {
+                for(int j=y+1;j<MATRIX_HEIGHT;j++)
+                {
+                    if(m_matrix[i][j])
+                    {
+                        if(m_matrix[i][j]->getValue() == gr->getValue())
+                        {
+                            if(b)
+                            {
+                                m_matrix[i][j]->setTips();
+                                gr->setTips();
+                            }
+                            return true;
+                        }
+                        else
+                        {
+                            break;
+                        }
+                        
+                    }
+                    else
+                        continue;
+                }
+            }
+            //对下面一行的判断
+            if(y>0)
+            {
+                for(int j=y-1;j>=0;j--)
+                {
+                    if(m_matrix[i][j])
+                    {
+                        if(m_matrix[i][j]->getValue() == gr->getValue())
+                        {
+                            if(b)
+                            {
+                                m_matrix[i][j]->setTips();
+                                gr->setTips();
+                            }
+                            return true;
+                        }
+                        else
+                        {
+                            break;
+                        }
+                        
+                    }
+                    else
+                        continue;
+                }
+                
+            }
+        }
+    }
+    
+    flag=false;
+    int up=0,down=0;
+    
+    for(int j=y;j>=0;j--)
+    {
+        if (m_matrix[x][j])
+        {
+            if(flag)
+                break;
+        }
+        else
+        {
+            down++;
+            flag=true;
+        }
+    }
+    
+    //可以向下移动
+    if(flag)
+    {
+        for(int j=y-1;down>0;j--,down--)
+        {
+            //对左边一行的判断
+            if(x>0)
+            {
+                for(int i=x-1;i>=0;i--)
+                {
+                    if(m_matrix[i][j])
+                    {
+                        if(m_matrix[i][j]->getValue()==gr->getValue())
+                        {
+                            if(b)
+                            {
+                                m_matrix[i][j]->setTips();
+                                gr->setTips();
+                            }
+                            return true;
+                        }
+                        else
+                            break;
+                    }
+                    else
+                        continue;
+                }
+            }
+            //对右边一行的判断
+            if(x<MATRIX_WIDTH-1)
+            {
+                for(int i=x+1;i<MATRIX_WIDTH;i++)
+                {
+                    if(m_matrix[i][j])
+                    {
+                        if(m_matrix[i][j]->getValue()==gr->getValue())
+                        {
+                            if(b)
+                            {
+                                m_matrix[i][j]->setTips();
+                                gr->setTips();
+                            }
+                            return true;
+                        }
+                        else
+                            break;
+                    }
+                    else
+                        continue;
+                }
+            }
+        }
+    }
+    
+    flag=false;
+    for(int j=y;j<MATRIX_HEIGHT;j++)
+    {
+        if(m_matrix[x][j])
+        {
+            if(flag)
+                break;
+        }
+        else
+        {
+            up++;
+            flag=true;
+        }
+    }
+    
+    //可以向上移动
+    if(flag)
+    {
+        for(int j=y+1;up>0;j++,up--)
+        {
+            //对左边一行的判断
+            if(x>0)
+            {
+                for(int i=x-1;i>=0;i--)
+                {
+                    if(m_matrix[i][j])
+                    {
+                        if(m_matrix[i][j]->getValue()==gr->getValue())
+                        {
+                            if(b)
+                            {
+                                m_matrix[i][j]->setTips();
+                                gr->setTips();
+                            }
+                            return true;
+                        }
+                        else
+                            break;
+                    }
+                    else
+                        continue;
+                }
+            }
+            //对右边一行的判断
+            if(x<MATRIX_WIDTH-1)
+            {
+                for(int i=x+1;i<MATRIX_WIDTH;i++)
+                {
+                    if(m_matrix[i][j])
+                    {
+                        if(m_matrix[i][j]->getValue()==gr->getValue())
+                        {
+                           if(b)
+                           {
+                               m_matrix[i][j]->setTips();
+                               gr->setTips();
+                           }
+                            return true;
+                        }
+                        else
+                           break;
+                    }
+                    else
+                        continue;
+                }
+            }
+        }
+    }
+    
+    
+    return false;
+}
+
+void GameScene::update(float)
+{
+    //时间记录
+    if(m_status!=STATUS::PAUSE && m_isGameStart)
+        m_time++;
+   
+    //刷新最高得分
+    if(m_score_now>m_score)
+    {
+        auto lab_score=static_cast<Label *>(this->getChildByTag(2));
+        lab_score->setString(StringUtils::format("最高得分%d",m_score_now));
+    }
+   
+    
+    //判断是否无路可走或已全部完成消除
+    bool flag=false;
+    int sum=0;
+    for(int i=0;i<MATRIX_WIDTH;i++)
+    {
+        for(int j=0;j<MATRIX_HEIGHT;j++)
+        {
+            if(m_matrix[i][j])
+            {
+                sum++;
+                if(this->checkRemoveAble(m_matrix[i][j],false))
+                {
+                    flag=true;
+                    break;
+                }
+            }
+        }
+    }
+    
+    //如果所有麻将牌都被消除时过关成功并直接结算
+    if(sum==0 && m_status!=STATUS::PAUSE)
+    {
+        this->summary(true);
+    }
+        
+    //无路可走时弹出是否结算的选项
+    if(!flag  &&  this->m_status!=STATUS::PAUSE)
+    {
+        auto layer=LayerColor::create(Color4B(100, 100, 100, 100),VISIBLE_SIZE.width,VISIBLE_SIZE.height/2);
+        layer->setPosition(Vec2(0,VISIBLE_SIZE.height/4)+ Vec2(0,VISIBLE_SIZE.height));
+        layer->runAction(MoveBy::create(0.2f, Vec2(0,-VISIBLE_SIZE.height)));
+        this->addChild(layer,99);
+        
+        this->m_status=STATUS::PAUSE;
+        
+        auto lab=Label::createWithSystemFont("没有可以消除的麻将牌了\n是否结算？","",40);
+        lab->setPosition(Vec2(VISIBLE_SIZE.width/2,VISIBLE_SIZE.height/2));
+        layer->addChild(lab);
+        
+        auto btn_yes=ui::Button::create("59.png");
+        btn_yes->setPosition(Vec2(VISIBLE_SIZE.width/4,VISIBLE_SIZE.height/8));
+        layer->addChild(btn_yes);
+        
+        btn_yes->addClickEventListener([=](Ref *){
+            layer->removeFromParent();
+            this->summary(false);
+        });
+        
+        auto btn_no=ui::Button::create("59.png");
+        btn_no->setPosition(Vec2(VISIBLE_SIZE.width *3 /4,VISIBLE_SIZE.height/8));
+        layer->addChild(btn_no);
+        
+        btn_no->addClickEventListener([=](Ref *){
+            //Director::getInstance()->popScene();
+            layer->removeFromParent();
+            this->m_status=STATUS::NORMAL;
+        });
+    }
+}
+
+//检查某块指定的麻将牌能否在某个指定的方向上被消除
+bool GameScene::checkRemoveAble(Grid * gr,Direction dr)
+{
+    auto x=gr->getX();
+    auto y=gr->getY();
+    
+    switch (dr) {
+        case Direction::UP:
+        {
+            for(int i=y+1;i<MATRIX_HEIGHT;i++)
+            {
+                if(m_matrix[x][i]!=nullptr)
+                {
+                    if (m_matrix[x][i]->getValue()==gr->getValue())
+                    {
+                        return true;
+                    }
+                    else
+                    {
+                        break;
+                    }
+                }
+                else
+                    continue;
+            }
+        
+        }
+            break;
+        case Direction::DOWN:
+        {
+            for(int i=y-1;i>=0;i--)
+            {
+                if(m_matrix[x][i]!=nullptr)
+                {
+                    if(m_matrix[x][i]->getValue()==gr->getValue())
+                    {
+                        return true;
+                    }
+                    else
+                    {
+                        break;
+                    }
+                }
+                else
+                    continue;
+            }
+        }
+            break;
+        case Direction::LEFT:
+        {
+            for(int j=x-1;j<=0;j--)
+            {
+                if(m_matrix[j][y])
+                {
+                    if(m_matrix[j][y]->getValue()==gr->getValue())
+                    {
+                        return true;
+                    }
+                    else
+                    {
+                        break;
+                    }
+                }
+                else
+                    continue;
+            }
+        }
+            break;
+        case Direction::RIGHT:
+        {
+            for(int j=x+1;j<MATRIX_WIDTH;j++)
+            {
+                if(m_matrix[j][y])
+                {
+                    if (m_matrix[j][y]->getValue()==gr->getValue())
+                    {
+                        return true;
+                    }
+                    else
+                    {
+                        break;
+                    }
+                }
+                else
+                    continue;
+            }
+
+        }
+            break;
+        default:
+            break;
+    }
+    
+    return false;
+}
+
+//检查两块麻将牌是否能被消除
+bool GameScene::checkRemoveAble(Grid * first,Grid * second)
+{
+    if(first==second)
+        return false;
+    
+    bool flag=true;
+    if (first->getValue()==second->getValue())
+    {
+        auto x_1=first->getX();
+        auto x_2=second->getX();
+        auto y_1=first->getY();
+        auto y_2=second->getY();
+        //tong hang
+        if(x_1==x_2)
+        {
+            //up
+            if(y_1>y_2)
+            {
+                for(int i=y_2+1;i<y_1;i++)
+                {
+                    if(m_matrix[x_1][i])
+                    {
+                        flag=false;
+                        break;
+                    }
+                }
+            }
+            //down
+            else if(y_2>y_1)
+            {
+                for(int i=y_1+1;i<y_2;i++)
+                {
+                    if(m_matrix[x_1][i])
+                    {
+                        flag=false;
+                        break;
+                    }
+                }
+            }
+        }
+        //tong lie
+        else if(y_1==y_2)
+        {
+            //right
+            if(x_1>x_2)
+            {
+                for(int i=x_2+1;i<x_1;i++)
+                {
+                    if(m_matrix[i][y_1])
+                    {
+                        flag=false;
+                        break;
+                    }
+                }
+            }
+            //left
+            else if(x_2>x_1)
+            {
+                for(int i=x_1+1;i<x_2;i++)
+                {
+                    if(m_matrix[i][y_1])
+                    {
+                        flag=false;
+                        break;
+                    }
+                }
+            }
+        }
+        else
+        {
+            flag=false;
+        }
+    }
+    else
+    {
+        flag=false;
+    }
+    
+    return flag;
+}
+
+//暂停界面
+void GameScene::setPauseScene()
+{
+    auto layer=LayerColor::create(Color4B(50, 50, 50, 255),VISIBLE_SIZE.width,MATRIX_SIZZE_Y * MATRIX_HEIGHT);
+    layer->setPosition(Vec2(0,start_pos.y + VISIBLE_SIZE.height));
+    layer->runAction(MoveBy::create(0.2f, Vec2(0,-VISIBLE_SIZE.height)));
+    this->addChild(layer,9);
+    
+    auto btn_back=ui::Button::create("59.png");
+    btn_back->setPosition(Vec2(VISIBLE_SIZE.width/2,VISIBLE_SIZE.height * 1.5 / 4));
+    layer->addChild(btn_back,5);
+    
+    btn_back->addClickEventListener([=](Ref *){
+        //回到游戏
+        layer->runAction(Sequence::create(MoveBy::create(0.2f,Vec2(0,VISIBLE_SIZE.height/2)),CallFuncN::create([=](Ref *){
+            this->m_status=STATUS::NORMAL;
+            layer->removeFromParent();
+        }),nullptr));
+    });
+    
+    auto btn_over=ui::Button::create("59.png");
+    btn_over->setPosition(Vec2(VISIBLE_SIZE.width/2,VISIBLE_SIZE.height/4));
+    layer->addChild(btn_over,5);
+    
+    btn_over->addClickEventListener([=](Ref *){
+        //游戏结算，会弹框询问是否真的结算
+        auto layer_sum=LayerColor::create(Color4B(100,100,100,100),VISIBLE_SIZE.width,MATRIX_SIZZE_Y * MATRIX_HEIGHT);
+        layer_sum->setPosition(Vec2(start_pos));
+        this->addChild(layer_sum,99);
+        
+        auto btn_yes=ui::Button::create("59.png");
+        btn_yes->setPosition(Vec2(VISIBLE_SIZE.width/4,VISIBLE_SIZE.height/2));
+        layer_sum->addChild(btn_yes);
+        
+        btn_yes->addClickEventListener([=](Ref *){
+            int count=0;
+            for(int i=0;i<MATRIX_WIDTH;i++)
+            {
+                for(int j=0;j<MATRIX_HEIGHT;j++)
+                {
+                    if(m_matrix[i][j] && this->checkRemoveAble(m_matrix[i][j], false))
+                    {
+                        m_matrix[i][j]->setTips();
+                        count++;
+                    }
+                }
+            }
+            layer->setOpacity(100);
+            layer_sum->setOpacity(100);
+
+            auto lab_tips=Label::createWithSystemFont(StringUtils::format("尚有%d步可走",count/2), "", 40);
+            lab_tips->setPosition(Vec2(VISIBLE_SIZE.width/2,VISIBLE_SIZE.height * 3 / 4));
+            layer_sum->addChild(lab_tips);
+            
+            lab_tips->runAction(Sequence::create(DelayTime::create(2),CallFuncN::create([=](Ref *){
+                this->summary(false);
+                layer_sum->removeFromParent();
+                layer->removeFromParent();
+            }) ,NULL));
+        });
+        
+        auto btn_no=ui::Button::create("59.png");
+        btn_no->setPosition(Vec2(VISIBLE_SIZE.width * 3 /4,VISIBLE_SIZE.height/2));
+        layer_sum->addChild(btn_no);
+        
+        btn_no->addClickEventListener([=](Ref *){
+            layer_sum->removeFromParent();
+        });
+    });
+    
+    auto btn_audio=ui::Button::create("59.png");
+    btn_audio->setPosition(Vec2(VISIBLE_SIZE.width/4,VISIBLE_SIZE.height/4));
+    layer->addChild(btn_audio,5);
+    
+    btn_audio->addClickEventListener([=](Ref *){
+        //音效控制
+    });
+    
+    auto btn_main=ui::Button::create("59.png");
+    btn_main->setPosition(Vec2(VISIBLE_SIZE.width * 3/4,VISIBLE_SIZE.height/4));
+    layer->addChild(btn_main,5);
+    
+    btn_main->addClickEventListener([=](Ref *){
+        //返回主菜单
+        Director::getInstance()->popScene();
+    });
+
+    
+    this->m_status=STATUS::PAUSE;
+}
+
+
+//结算游戏，参数表示是否已全部消除
+void GameScene::summary(bool b)
+{
+    TDInvFileUtils::deleteGameData(FILENAME);
+    
+    auto layer=LayerColor::create(Color4B(100,100, 100, 100),VISIBLE_SIZE.width,VISIBLE_SIZE.height/2);
+    layer->setPosition(Vec2(0,VISIBLE_SIZE.height/4)+ Vec2(0,VISIBLE_SIZE.height));
+    layer->runAction(MoveBy::create(0.2f, Vec2(0,-VISIBLE_SIZE.height)));
+    this->addChild(layer,99);
+    
+    this->m_status=STATUS::PAUSE;
+    
+    auto lab_main=Label::createWithSystemFont("游戏结算", "", 40);
+    lab_main->setPosition(Vec2(VISIBLE_SIZE.width/2,VISIBLE_SIZE.height/2 - MATRIX_HEIGHT * 2));
+    layer->addChild(lab_main);
+    
+    if(m_score_now>m_score)
+    {
+        auto lab_high=Label::createWithSystemFont("刷新最高分！", "", 40);
+        lab_high->setPosition(Vec2(VISIBLE_SIZE.width - MATRIX_SIZZE_X,VISIBLE_SIZE.height/2 - MATRIX_SIZZE_Y));
+        layer->addChild(lab_high);
+        
+        lab_high->setRotation(45);
+    }
+    
+    auto lab_score=Label::createWithSystemFont("", "", 40);
+    lab_score->setPosition(Vec2(VISIBLE_SIZE.width/2,VISIBLE_SIZE.height/3));
+    layer->addChild(lab_score);
+    
+    lab_score->setString(StringUtils::format("获得分数为：%d",m_score_now));
+    
+    auto lab_step=Label::createWithSystemFont("", "", 40);
+    lab_step->setPosition(Vec2(VISIBLE_SIZE.width/2,VISIBLE_SIZE.height/5));
+    layer->addChild(lab_step);
+    
+    if(b)
+    {
+        lab_step->setString("恭喜！您全部消除了！");
+    }
+    else
+    {
+        lab_step->setString(StringUtils::format("一共完成了%d步",m_score_now/SCORE));
+    }
+    
+    auto btn_main=ui::Button::create("59.png");
+    btn_main->setPosition(Vec2(VISIBLE_SIZE.width/2-VISIBLE_SIZE.width/4,VISIBLE_SIZE.height/8));
+    layer->addChild(btn_main);
+    
+    btn_main->addClickEventListener([=](Ref *){
+        Director::getInstance()->popScene();
+    });
+    
+    auto btn_ng=ui::Button::create("59.png");
+    btn_ng->setPosition(Vec2(VISIBLE_SIZE.width/2,VISIBLE_SIZE.height/8));
+    layer->addChild(btn_ng);
+    
+    btn_ng->addClickEventListener([=](Ref *){
+        auto scene=GameScene::createScene();
+        Director::getInstance()->replaceScene(scene);
+    });
+    
+    auto btn_gc=ui::Button::create("59.png");
+    btn_gc->setPosition(Vec2(VISIBLE_SIZE.width/2+VISIBLE_SIZE.width/4,VISIBLE_SIZE.height/8));
+    layer->addChild(btn_gc);
+    
+    btn_gc->addClickEventListener([=](Ref *){
+        
+    });
+    
+    //如果最高分超过历史最高分，或者只是达到同样的分数但是时间更少时将新的成绩保存起来
+    auto high=TDInvFileUtils::getHighFile(SCOREFILE);
+    if(m_score_now>high.score ||(m_score_now==high.score && m_time<high.time))
+    {
+        high.score=m_score_now;
+        high.time=this->m_time;
+        TDInvFileUtils::saveHighFile(high, SCOREFILE);
+    }
+}
+
+//读取游戏记录
+void GameScene::readGame()
+{
+    //读取游戏进度
+    this->saveFile=TDInvFileUtils::getFileByName(FILENAME);
+    //按记录加载矩阵
+    for(int i=0;i<saveFile.matrix_num_X * saveFile.matrix_num_Y;i++)
+    {
+        int x=saveFile.matrix[i].x_pos;
+        int y=saveFile.matrix[i].y_pos;
+        if(saveFile.matrix[i].value!=0)
+        {
+            auto grid=Grid::create(saveFile.matrix[i].value);
+            grid->setPosition(Vec2(VISIBLE_SIZE.width/2 + (x - (MATRIX_WIDTH-1)/2) * MATRIX_SIZZE_X ,VISIBLE_SIZE.height/2 +(y - MATRIX_HEIGHT/2) * MATRIX_SIZZE_Y + MATRIX_SIZZE_Y/2));
+            this->addChild(grid);
+            grid->setXY(x, y);
+                
+            m_matrix[x][y]=grid;
+        }
+        else
+        {
+            m_matrix[x][y]=nullptr;
+        }
+    }
+    //用存档中的操作记录代替已有的操作记录
+    this->controlCount.clear();
+    controlCount=saveFile.moves;
+    //替换分数
+    m_score_now=saveFile.score;
+}
+
+//存储游戏进度，包含当前麻将牌界面、已操作的记录
+void GameScene::SaveGame()
+{
+    game_data temp;
+    //准备分数
+    temp.isSaved=true;
+    temp.score=m_score_now;
+    //准备步数
+    temp.steps=m_score_now/SCORE;
+    //准备矩阵
+    pos_data pos_temp;
+    temp.matrix_num_X=MATRIX_WIDTH;
+    temp.matrix_num_Y=MATRIX_HEIGHT;
+    
+    for(int i=0;i<MATRIX_WIDTH;i++)
+    {
+        for(int j=0;j<MATRIX_HEIGHT;j++)
+        {
+            if(m_matrix[i][j])
+            {
+                pos_temp.x_pos=i;
+                pos_temp.y_pos=j;
+                pos_temp.value=m_matrix[i][j]->getValue();
+                temp.matrix.push_back(pos_temp);
+            }
+            else
+            {
+                pos_temp.x_pos=i;
+                pos_temp.y_pos=j;
+                pos_temp.value=0;
+                temp.matrix.push_back(pos_temp);
+            }
+        }
+    }
+    //准备操作
+    temp.move_num=static_cast<int>(this->controlCount.size());
+    temp.moves=this->controlCount;
+        
+    TDInvFileUtils::saveFile(temp, FILENAME);
+    
+}
+
+//判断开场时是否有5对可消除的麻将牌
+bool GameScene::isFivePair()
+{
+    int temp=0;
+    for(int i=0;i<MATRIX_WIDTH;i++)
+    {
+        for(int j=0;j<MATRIX_HEIGHT;j++)
+        {
+            if(this->checkRemoveAble(m_matrix[i][j], false))
+            {
+                temp++;
+            }
+        }
+    }
+    
+    if(temp<10)
+        return false;
+    else
+        return true;
+}
